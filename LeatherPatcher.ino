@@ -26,22 +26,40 @@
    - When the pedal is released back to STOP, the motor DISABLES 
      after a short delay (default 100 ms).
    - These safety rules cannot be turned off.
+   - **Important safety note:** Always test the system with the motor 
+     NOT connected to the sewing machine belt first. Confirm that the 
+     pedal zones, LED feedback, and motor behavior are correct before 
+     attaching the belt to the flywheel. This avoids unexpected motion 
+     of the machine during initial setup and tuning.
 
-   CONFIGURATION:
-   All tunable settings are in the USER CONFIGURATION section below.
-   To change a setting:
-     1. Open this sketch in Arduino IDE.
-     2. Scroll down to the section marked "=== USER CONFIGURATION ===".
-     3. Edit the number or true/false value.
-     4. Click the ✔ Verify button to check.
-     5. Click → Upload to send it to the Arduino Nano.
+   HOW TO CHANGE SETTINGS:
+   1. Open this file in the Arduino IDE.
+   2. Scroll down to the section marked "=== USER CONFIGURATION ===".
+   3. Each setting is explained in comments next to it.
+   4. To change: replace the number (or true/false) with a new value.
+   5. Example: To flip motor direction, change:
+        #define REVERSE_DIRECTION false
+      into:
+        #define REVERSE_DIRECTION true
+   6. After making changes, click the ✔ Verify button in the IDE to check.
+   7. Then click → Upload to send to the Arduino Nano.
+
+   KEY SETTINGS:
+   - Pins: STEP_PIN, DIR_PIN, ENABLE_PIN, ANALOG_PIN
+   - Max speed & acceleration: MAX_SPEED_SPS, MAX_ACCEL_SPS2
+   - Pedal calibration: ANALOG_MIN_COUNTS, ANALOG_MAX_COUNTS
+   - Deadband and hold band: ANALOG_DEADBAND_COUNTS, HOLD_BAND_COUNTS
+   - Input curve: INPUT_CURVE and LOG_CURVE_K
+   - Safety timing: ARM_DELAY_MS and DISABLE_DELAY_MS
 
    LED STATUS (on Nano’s built-in LED pin 13):
      - Startup/arming: slow blink (1 Hz).
-     - Armed but stopped: double blink every second.
-     - Running (pedal pressed): LED solid ON.
-     - Disabled by pedal in deadband: LED OFF.
+     - Armed but STOP (pedal up): double blink every second.
+     - Hold band (needle locked): fast blink (2 Hz).
+     - Running (pedal pressed, sewing): solid ON.
+     - Disabled (driver cut): LED OFF.
    ======================================================= */
+
 
 
 // === USER CONFIGURATION ===
@@ -60,9 +78,14 @@
 #define MAX_SPEED_SPS       4000    // max step rate at 5V input (steps per second)
 #define MAX_ACCEL_SPS2      800     // max acceleration (steps per second^2)
 
+// --- Pedal calibration ---
+#define ANALOG_MIN_COUNTS   10     // ADC value for pedal fully at rest
+#define ANALOG_MAX_COUNTS   1010   // ADC value for pedal fully pressed
+
 // --- Analog input handling ---
 #define ANALOG_REVERSED        false  // true = 5V = stop, false = 0V = stop
-#define ANALOG_DEADBAND_COUNTS 20     // deadband around 0 input (ADC counts, ~100 mV)
+#define ANALOG_DEADBAND_COUNTS 20     // zone below this disables driver
+#define HOLD_BAND_COUNTS       60     // zone above deadband but below this = hold needle
 #define ANALOG_FILTER_SAMPLES  8      // running average window size (samples)
 
 // --- Control loop ---
@@ -87,7 +110,6 @@
 AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
 RunningAverage filter(ANALOG_FILTER_SAMPLES);
 
-const int ANALOG_MAX = 1023;
 const int LED_PIN = 13;  // built-in Nano LED
 
 // Safety state
@@ -108,18 +130,16 @@ bool ledState = false;
 //  Helper Functions
 // =======================================================
 
-// Normalize raw ADC (0-1023) to 0.0-1.0, with reversal if needed
+// Normalize raw ADC to 0.0–1.0 with calibration + reversal
 float normalizeADC(int raw) {
-  float u = (float)raw / (float)ANALOG_MAX;
+  if (raw < ANALOG_MIN_COUNTS) raw = ANALOG_MIN_COUNTS;
+  if (raw > ANALOG_MAX_COUNTS) raw = ANALOG_MAX_COUNTS;
+
+  float u = (float)(raw - ANALOG_MIN_COUNTS) / (float)(ANALOG_MAX_COUNTS - ANALOG_MIN_COUNTS);
+
   if (ANALOG_REVERSED) u = 1.0 - u;
   if (u < 0.0) u = 0.0;
   if (u > 1.0) u = 1.0;
-  return u;
-}
-
-// Apply deadband to normalized input
-float applyDeadband(float u) {
-  if (u * ANALOG_MAX <= ANALOG_DEADBAND_COUNTS) return 0.0;
   return u;
 }
 
@@ -138,7 +158,7 @@ float applyCurve(float u) {
 }
 
 // LED status indication
-void updateLED(unsigned long now, bool running, bool inDeadband) {
+void updateLED(unsigned long now, bool running, bool inHold, bool inDeadband) {
   if (!armed) {
     // Startup/arming: slow blink 1 Hz
     if (now - lastLED >= 500) {
@@ -147,8 +167,14 @@ void updateLED(unsigned long now, bool running, bool inDeadband) {
       lastLED = now;
     }
   } else if (running) {
-    // Running: solid ON
-    digitalWrite(LED_PIN, HIGH);
+    digitalWrite(LED_PIN, HIGH); // solid on
+  } else if (inHold) {
+    // Hold band: blink 2 Hz
+    if (now - lastLED >= 250) {
+      ledState = !ledState;
+      digitalWrite(LED_PIN, ledState);
+      lastLED = now;
+    }
   } else if (inDeadband) {
     // Armed but pedal at stop: double blink
     unsigned long t = now % 1000;
@@ -158,7 +184,6 @@ void updateLED(unsigned long now, bool running, bool inDeadband) {
       digitalWrite(LED_PIN, LOW);
     }
   } else {
-    // Disabled by pedal in deadband: LED OFF
     digitalWrite(LED_PIN, LOW);
   }
 }
@@ -199,7 +224,7 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // --- Read analog input (raw for safety, filtered for speed) ---
+  // --- Read analog input (raw for safety, filtered for control) ---
   int rawADC = analogRead(ANALOG_PIN);
   filter.addValue(rawADC);
   int filteredADC = (int)filter.getAverage();
@@ -217,11 +242,12 @@ void loop() {
     }
     stepper.stop(); // ensure no movement
     digitalWrite(ENABLE_PIN, HIGH);
-    updateLED(now, false, false);
+    updateLED(now, false, false, false);
     return;
   }
 
   bool inDeadband = false;
+  bool inHold = false;
   bool running = false;
 
   // --- Control loop at CONTROL_HZ ---
@@ -229,10 +255,10 @@ void loop() {
     lastControlUpdate = now;
 
     float u = normalizeADC(filteredADC);
-    u = applyDeadband(u);
+    int scaledADC = (int)(u * 1023);
 
-    if (u == 0.0) {
-      // Inside deadband
+    if (scaledADC <= ANALOG_DEADBAND_COUNTS) {
+      // Zone 1: Zero Deadband → disable driver
       inDeadband = true;
       if (disableStart == 0) {
         disableStart = now;
@@ -240,10 +266,18 @@ void loop() {
         digitalWrite(ENABLE_PIN, HIGH); // disable driver
         stepper.stop();
       }
-    } else {
-      // Outside deadband
+    } 
+    else if (scaledADC <= HOLD_BAND_COUNTS) {
+      // Zone 2: Hold Band → enable driver, hold position
+      inHold = true;
       disableStart = 0;
-      digitalWrite(ENABLE_PIN, LOW); // enable driver
+      digitalWrite(ENABLE_PIN, LOW);
+      stepper.moveTo(stepper.currentPosition()); // lock position
+    } 
+    else {
+      // Zone 3: Throttle
+      disableStart = 0;
+      digitalWrite(ENABLE_PIN, LOW); 
       running = true;
 
       float curved = applyCurve(u);
@@ -252,7 +286,6 @@ void loop() {
       stepper.setMaxSpeed(MAX_SPEED_SPS);
       stepper.setAcceleration(MAX_ACCEL_SPS2);
 
-      // Virtual position trick for velocity control
       static double virtualPos = 0;
       virtualPos += targetSpeed / CONTROL_HZ;
       stepper.moveTo((long)virtualPos);
@@ -263,5 +296,5 @@ void loop() {
   stepper.run();
 
   // Update LED status
-  updateLED(now, running, inDeadband);
+  updateLED(now, running, inHold, inDeadband);
 }
